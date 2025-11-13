@@ -1,0 +1,192 @@
+import os
+import sys
+import argparse
+import time
+import numpy as np
+import torch
+from torch import optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import pickle
+from torch import autograd
+
+from utils.dataloader import TrajectoryDataset
+from model.CIE_MGCN import CIE_MGCN
+from model.vaeloss import compute_vae_loss
+
+sys.path.append(os.getcwd())
+from utils.torchutils import *
+from utils.utils import prepare_seed, AverageMeter
+
+# maybe need to close
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
+
+
+parser = argparse.ArgumentParser()
+
+# task setting
+parser.add_argument('--obs_len', type=int, default=20)
+parser.add_argument('--pred_len', type=int, default=12)
+
+parser.add_argument('--sdd_scale', type=float, default=50.0)
+parser.add_argument('--dataset', type=str, default='Lng',help='Lng')  
+parser.add_argument('--dataset_Mo', type=str, default='Mo',help='Mo')  
+# model architecture
+parser.add_argument('--pos_concat', type=bool, default=True)
+parser.add_argument('--cross_motion_only', type=bool, default=True)
+
+parser.add_argument('--tf_model_dim', type=int, default=128)
+parser.add_argument('--tf_ff_dim', type=int, default=128)
+parser.add_argument('--tf_nhead', type=int, default=8)
+parser.add_argument('--tf_dropout', type=float, default=0.1)
+
+parser.add_argument('--he_tf_layer', type=int, default=2)
+parser.add_argument('--fe_tf_layer', type=int, default=2) 
+parser.add_argument('--fd_tf_layer', type=int, default=2)
+
+parser.add_argument('--he_out_mlp_dim', default=None)
+parser.add_argument('--fe_out_mlp_dim', default=None)
+parser.add_argument('--fd_out_mlp_dim', default=None)
+
+parser.add_argument('--num_tcn_layers', type=int, default=1)
+parser.add_argument('--asconv_layer_num', type=int, default=3)
+
+parser.add_argument('--pred_dim', type=int, default=2)
+
+parser.add_argument('--pooling', type=str, default='mean')
+parser.add_argument('--nz', type=int, default=32)
+parser.add_argument('--sample_k', type=int, default=20)
+
+parser.add_argument('--max_train_agent', type=int, default=100)
+parser.add_argument('--rand_rot_scene', type=bool, default=True)
+parser.add_argument('--discrete_rot', type=bool, default=False)
+
+# loss config
+parser.add_argument('--mse_weight', type=float, default=1.0)
+parser.add_argument('--kld_weight', type=float, default=1.0)
+parser.add_argument('--kld_min_clamp', type=float, default=2.0)
+parser.add_argument('--var_weight', type=float, default=1.0)
+parser.add_argument('--var_k', type=int, default=20)
+
+# training options
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--scheduler', type=str, default='step')
+
+parser.add_argument('--num_epochs', type=int, default=80)
+parser.add_argument('--lr_fix_epochs', type=int, default=10)
+parser.add_argument('--decay_step', type=int, default=10)
+parser.add_argument('--decay_gamma', type=float, default=0.5)
+
+parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('--seed', type=int, default=1)
+
+parser.add_argument('--save_freq', type=int, default=1)
+parser.add_argument('--print_freq', type=int, default=20)
+args = parser.parse_args([])
+
+
+def print_log(dataset, epoch, total_epoch, index, total_samples, seq_name, frame, loss_str):
+    # form a string and adjust format
+    print_str = '{} | Epo: {:02d}/{:02d}, It: {:04d}/{:04d}, seq: {:s}, frame {:05d}, {}' \
+        .format(dataset + ' vae', epoch, total_epoch, index, total_samples, str(seq_name), int(frame), loss_str)
+    print(print_str)
+
+
+
+def train(args, epoch, model, optimizer, scheduler, loader_train):
+    train_loss_meter = {'mse': AverageMeter(), 'kld': AverageMeter(),
+                        'sample': AverageMeter(), 'total_loss': AverageMeter()}
+    data_index = 0
+    for cnt, batch in enumerate(loader_train):
+        seq_name = 'data'
+
+        frame_idx = int(batch.pop()[0])
+        batch = [tensor[0].cuda() for tensor in batch]
+        obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
+        obs_loss_mask, pred_loss_mask, V_obs, A_obs, V_tr, A_tr, A_TPCA_obs,\
+        A_TPCA_tr, A_vs_obs, A_vs_tr = batch
+
+        V_obs_tmp = V_obs.unsqueeze(0).permute(0, 3, 1, 2)
+        model.set_data(obs_traj_rel, pred_traj_gt_rel, obs_loss_mask, pred_loss_mask,\
+                       V_obs_tmp, A_obs.squeeze(),A_TPCA_obs.squeeze(), A_vs_obs.squeeze())               # [T N or N*sn 2]
+        fut_motion_orig, train_dec_motion, infer_dec_motion, q_z_dist, p_z_dist, fut_mask = model.forward(args.sample_k)
+
+        optimizer.zero_grad()
+        total_loss, loss_dict, loss_dict_uw = compute_vae_loss(args, fut_motion_orig, train_dec_motion,
+                                                               infer_dec_motion, fut_mask, q_z_dist, p_z_dist)
+        total_loss.backward() 
+        optimizer.step()
+
+        train_loss_meter['total_loss'].update(total_loss.item())
+        for key in loss_dict_uw.keys():
+            train_loss_meter[key].update(loss_dict_uw[key])  # printed loss item from loss_dict_uw
+
+        # print loss
+        if cnt - data_index == args.print_freq:
+            losses_str = ' '.join([f'{x}: {y.avg:.3f} ({y.val:.3f})' for x, y in train_loss_meter.items()])
+            print_log(args.dataset, epoch, args.num_epochs, cnt, len(loader_train), seq_name, frame_idx, losses_str)
+            data_index = cnt
+
+    scheduler.step()
+    model.step_annealer()
+
+
+
+data_set = './dataset/' + args.dataset + '/'
+
+prepare_seed(args.seed)
+torch.set_default_dtype(torch.float32)
+device = torch.device('cuda', index=args.gpu) if torch.cuda.is_available() else torch.device('cpu')
+if torch.cuda.is_available():
+    torch.cuda.set_device(args.gpu)
+
+traj_scale = 1.0
+
+obs_seq_len = args.obs_len
+
+pred_seq_len = args.pred_len
+
+data_set_Mo = './dataset/' + args.dataset_Mo + '/'
+data_set = './dataset/' + args.dataset + '/'
+
+dset_train = TrajectoryDataset(
+        data_dir =  data_set+'train/',
+        data_dir_Mo = data_set_Mo+'train/',
+        obs_len = obs_seq_len,
+        pred_len = pred_seq_len,
+        skip=1,norm_lap_matr=True)
+torch.save(dset_train, "./dataset/dset_train.pt")
+dset_train = torch.load("./dataset/dset_train.pt")
+
+loader_train = DataLoader(
+    dset_train,
+    batch_size=1, 
+    shuffle=True,
+    num_workers=0)
+
+
+''' === set model === '''
+CIE_MGCN = CIE_MGCN(args)
+optimizer = optim.Adam(CIE_MGCN.parameters(), lr=args.lr)
+scheduler_type = args.scheduler
+if scheduler_type == 'linear':
+    scheduler = get_scheduler(optimizer, policy='lambda', nepoch_fix=args.lr_fix_epochs, nepoch=args.num_epochs)
+elif scheduler_type == 'step':
+    scheduler = get_scheduler(optimizer, policy='step', decay_step=args.decay_step, decay_gamma=args.decay_gamma)
+else:
+    raise ValueError('unknown scheduler type!')
+
+checkpoint_dir = './checkpoints/' + args.dataset + '/vae/'
+if not os.path.exists(checkpoint_dir):
+    os.makedirs(checkpoint_dir)
+
+CIE_MGCN.set_device(device)
+CIE_MGCN.train()
+for epoch in range(args.num_epochs):
+    train(args, epoch, CIE_MGCN, optimizer, scheduler, loader_train)
+    if args.save_freq > 0 and (epoch + 1) % args.save_freq == 0:
+        cp_path = os.path.join(checkpoint_dir, 'model_%04d.p') % (epoch + 1)
+        model_cp = CIE_MGCN.state_dict()
+        torch.save(model_cp, cp_path)
